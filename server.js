@@ -1,11 +1,10 @@
 // ============================================================
-// youtubeHUB Proxy Backend v4.0 - Invidious API based
-// No cookies needed | Simple & Reliable
+// youtubeHUB Proxy Backend v5.0 - untube based
 // ============================================================
 
 const express = require('express');
 const cors = require('cors');
-const fetch = require('node-fetch');
+const untube = require('untube');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -24,7 +23,7 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'youtubeHUB proxy',
-    version: '4.0.0 (invidious)',
+    version: '5.0.0 (untube)',
     time: new Date().toISOString()
   });
 });
@@ -38,20 +37,8 @@ function extractVideoId(url) {
   return match ? match[1] : null;
 }
 
-// ============ INVIDIOUS INSTANCES (Multiple fallback) ============
-const INVIDIOUS_INSTANCES = [
-  'https://inv.nadeko.net',
-  'https://invidious.nerdvpn.de',
-  'https://yewtu.be',
-  'https://invidious.f5.si',
-  'https://iv.melmac.space',
-  'https://invidious.privacyredirect.com',
-  'https://invidious.reallyaweso.me',
-  'https://inv.tux.pizza'
-];
-
 // ============================================================
-// ROUTE 1: CREATE JOB (Invidious se video info)
+// ROUTE 1: CREATE JOB (untube se video info)
 // ============================================================
 app.post('/proxy/jobs', async (req, res) => {
   try {
@@ -68,135 +55,86 @@ app.post('/proxy/jobs', async (req, res) => {
 
     console.log('[Job] Creating for:', videoId, '| format:', format);
 
-    // ============ Multiple Invidious instances try karo ============
-    let videoData = null;
-    let workingInstance = null;
-
-    for (const instance of INVIDIOUS_INSTANCES) {
-      try {
-        console.log('[Job] Trying:', instance);
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 10000);
-
-        const apiRes = await fetch(instance + '/api/v1/videos/' + videoId, {
-          signal: controller.signal,
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/json'
-          }
-        });
-        clearTimeout(timeout);
-
-        if (apiRes.ok) {
-          videoData = await apiRes.json();
-          workingInstance = instance;
-          console.log('[Job] Success via:', instance);
-          break;
-        } else {
-          console.log('[Job] Bad status:', apiRes.status, 'from', instance);
-        }
-      } catch (e) {
-        console.log('[Job] Failed:', instance, '-', e.message);
-      }
-    }
-
-    if (!videoData) {
+    // ============ untube se info fetch karo ============
+    let info;
+    try {
+      info = await untube.getVideoInfo(videoId);
+    } catch (err) {
+      console.error('[Job] untube getInfo failed:', err.message);
       return res.status(503).json({
-        error: 'All Invidious instances failed',
-        message: 'YouTube source unavailable. Please try again.'
+        error: 'Unable to fetch video info',
+        message: 'YouTube blocked the request. Try again in a moment.'
       });
     }
 
-    const videoTitle = videoData.title || 'Video';
-    const videoDuration = videoData.lengthSeconds || 0;
-    const videoThumbnail = videoData.videoThumbnails && videoData.videoThumbnails[0]
-                         ? videoData.videoThumbnails[0].url
-                         : 'https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg';
+    const durationSec = parseInt(info.duration, 10) || 0;
+    const videoTitle = info.title || 'Video';
+    const videoThumbnail = info.thumbnail || 'https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg';
 
-    let chosenUrl = null;
+    let chosenFormatUrl = null;
     let qualityLabel = '1080p';
     let fileSize = 0;
 
     // ============ Format Selection ============
-    if (format === 'mp3') {
-      // ===== AUDIO =====
-      const audioFormats = (videoData.adaptiveFormats || []).filter(f =>
-        f.type && f.type.indexOf('audio') === 0
-      );
+    try {
+      if (format === 'mp3') {
+        const audioFormats = (info.formats || []).filter(f => f.vcodec === 'none' && f.acodec !== 'none');
+        if (audioFormats.length === 0) throw new Error('No audio format');
 
-      if (audioFormats.length === 0) {
-        return res.status(503).json({ error: 'No audio formats available' });
-      }
+        const targetBitrate = parseInt((audio_bitrate || '320k').replace('k', ''), 10) || 320;
+        audioFormats.sort((a, b) => (b.abr || 0) - (a.abr || 0));
 
-      const targetBitrate = parseInt((audio_bitrate || '320k').replace('k', ''), 10) || 320;
-
-      // Sort by bitrate descending
-      audioFormats.sort((a, b) => {
-        const ab = parseInt((a.bitrate || '0').toString().replace(/[^\d]/g, ''), 10) || 0;
-        const bb = parseInt((b.bitrate || '0').toString().replace(/[^\d]/g, ''), 10) || 0;
-        return bb - ab;
-      });
-
-      let chosen = audioFormats[0];
-      for (const f of audioFormats) {
-        const fBitrate = parseInt((f.bitrate || '0').toString().replace(/[^\d]/g, ''), 10) || 0;
-        if (fBitrate <= targetBitrate * 1000) {
+        let chosen = audioFormats[0];
+        for (const f of audioFormats) {
+          if ((f.abr || 0) >= targetBitrate) {
+            chosen = f;
+            break;
+          }
           chosen = f;
-          break;
         }
-        chosen = f;
-      }
 
-      chosenUrl = chosen.url;
-      fileSize = parseInt(chosen.clen || 0, 10) || 0;
-      const bitrateNum = parseInt((chosen.bitrate || '128000').toString().replace(/[^\d]/g, ''), 10) || 128000;
-      qualityLabel = Math.round(bitrateNum / 1000) + ' kbps';
-    } else {
-      // ===== VIDEO =====
-      const targetRes = parseInt((max_resolution || '1080').replace('p', ''), 10) || 1080;
-
-      // Progressive streams (video + audio combined) - formatStreams array mein hote hain
-      let progressive = (videoData.formatStreams || []).filter(f => {
-        const h = parseInt((f.resolution || '0').replace('p', ''), 10) || 0;
-        return h <= targetRes && h > 0;
-      });
-
-      if (progressive.length > 0) {
-        // Sort by resolution descending
-        progressive.sort((a, b) => {
-          const ah = parseInt((a.resolution || '0').replace('p', ''), 10) || 0;
-          const bh = parseInt((b.resolution || '0').replace('p', ''), 10) || 0;
-          return bh - ah;
-        });
-        chosenUrl = progressive[0].url;
-        qualityLabel = progressive[0].resolution || targetRes + 'p';
-        fileSize = parseInt(progressive[0].clen || 0, 10) || 0;
+        chosenFormatUrl = chosen.url;
+        qualityLabel = Math.round(chosen.abr || 128) + ' kbps';
+        fileSize = chosen.filesize || chosen.filesize_approx || 0;
       } else {
-        // Agar progressive na mile, to adaptive video try karo
-        let adaptive = (videoData.adaptiveFormats || []).filter(f =>
-          f.type && f.type.indexOf('video') === 0
+        const targetRes = parseInt((max_resolution || '1080').replace('p', ''), 10) || 1080;
+
+        // Progressive streams (audio+video combined)
+        let progressive = (info.formats || []).filter(f =>
+          f.ext === 'mp4' &&
+          f.vcodec !== 'none' &&
+          f.acodec !== 'none' &&
+          (f.height || 0) <= targetRes
         );
 
-        adaptive = adaptive.filter(f => {
-          const h = parseInt((f.resolution || '0').replace('p', ''), 10) || 0;
-          return h <= targetRes && h > 0;
-        });
+        if (progressive.length > 0) {
+          progressive.sort((a, b) => (b.height || 0) - (a.height || 0));
+          chosenFormatUrl = progressive[0].url;
+          qualityLabel = progressive[0].height ? progressive[0].height + 'p' : targetRes + 'p';
+          fileSize = progressive[0].filesize || progressive[0].filesize_approx || 0;
+        } else {
+          const videoOnly = (info.formats || []).filter(f =>
+            f.vcodec !== 'none' && (f.height || 0) <= targetRes
+          );
+          videoOnly.sort((a, b) => (b.height || 0) - (a.height || 0));
 
-        if (adaptive.length > 0) {
-          adaptive.sort((a, b) => {
-            const ah = parseInt((a.resolution || '0').replace('p', ''), 10) || 0;
-            const bh = parseInt((b.resolution || '0').replace('p', ''), 10) || 0;
-            return bh - ah;
-          });
-          chosenUrl = adaptive[0].url;
-          qualityLabel = adaptive[0].resolution || targetRes + 'p';
-          fileSize = parseInt(adaptive[0].clen || 0, 10) || 0;
+          if (videoOnly.length > 0) {
+            chosenFormatUrl = videoOnly[0].url;
+            qualityLabel = videoOnly[0].height ? videoOnly[0].height + 'p' : targetRes + 'p';
+            fileSize = videoOnly[0].filesize || videoOnly[0].filesize_approx || 0;
+          }
+        }
+
+        if (!chosenFormatUrl) {
+          throw new Error('No suitable video format');
         }
       }
-
-      if (!chosenUrl) {
-        return res.status(503).json({ error: 'No video formats available' });
-      }
+    } catch (err) {
+      console.error('[Job] Format selection error:', err.message);
+      return res.status(500).json({
+        error: 'No suitable format found',
+        message: err.message
+      });
     }
 
     const jobId = 'job_' + Date.now() + '_' + Math.random().toString(36).slice(2, 9);
@@ -209,13 +147,12 @@ app.post('/proxy/jobs', async (req, res) => {
       format: format || 'mp4',
       title: videoTitle,
       thumbnail: videoThumbnail,
-      duration: videoDuration,
+      duration: durationSec,
       videoId: videoId,
       quality: qualityLabel,
       size: fileSize,
-      s3_url: chosenUrl,
-      download_url: chosenUrl,
-      source: workingInstance,
+      s3_url: chosenFormatUrl,
+      download_url: chosenFormatUrl,
       created_at: new Date().toISOString()
     };
 
@@ -261,10 +198,14 @@ app.get('/proxy/download', async (req, res) => {
   console.log('[Download] Start:', safeFilename);
 
   try {
+    const fetch = require('node-fetch');
+
     const upstreamHeaders = {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       'Accept': '*/*',
-      'Accept-Language': 'en-US,en;q=0.9'
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Referer': 'https://www.youtube.com/',
+      'Origin': 'https://www.youtube.com'
     };
 
     if (req.headers.range) {
@@ -324,8 +265,8 @@ app.get('/proxy/download', async (req, res) => {
 // ============ START SERVER ============
 app.listen(PORT, () => {
   console.log('===========================================');
-  console.log('  youtubeHUB Proxy Server v4.0.0');
-  console.log('  Using Invidious API (no cookies!)');
+  console.log('  youtubeHUB Proxy Server v5.0.0');
+  console.log('  Using untube (yt-dlp port)');
   console.log('  Running on port ' + PORT);
   console.log('===========================================');
 });
