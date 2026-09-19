@@ -1,7 +1,7 @@
 {
   "name": "yt-proxy",
-  "version": "7.0.0",
-  "description": "CORS Proxy for youtubeHUB",
+  "version": "9.0.0",
+  "description": "Proxy for youtubeHUB using cobalt",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -9,8 +9,7 @@
   "dependencies": {
     "express": "^4.18.2",
     "cors": "^2.8.5",
-    "node-fetch": "^2.7.0",
-    "youtubei.js": "^10.0.0"
+    "node-fetch": "^2.7.0"
   },
   "engines": {
     "node": ">=18.0.0"
