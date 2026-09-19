@@ -1,13 +1,11 @@
 // ============================================================
-// youtubeHUB Proxy Backend v6.0 - yt-dlp + Cookies
-// 100% reliable YouTube download
+// youtubeHUB Proxy Backend v7.0 - youtubei.js (Pure JS)
 // ============================================================
 
 const express = require('express');
 const cors = require('cors');
-const youtubedl = require('youtube-dl-exec');
-const fs = require('fs');
-const path = require('path');
+const fetch = require('node-fetch');
+const { Innertube } = require('youtubei.js');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -19,34 +17,40 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '10mb' }));
 
-const jobs = {};
+// ============ YOUTUBE CLIENT SETUP ============
+let yt = null;
+let ytReady = false;
 
-// ============================================================
-// COOKIES SETUP - Environment variable se read karo
-// ============================================================
-const COOKIES_PATH = '/tmp/cookies.txt';
-let cookiesReady = false;
-
-try {
-  if (process.env.YOUTUBE_COOKIES) {
-    // Railway variable se cookies file banao
-    fs.writeFileSync(COOKIES_PATH, process.env.YOUTUBE_COOKIES, 'utf8');
-    cookiesReady = true;
-    console.log('[Cookies] Loaded from environment variable');
-  } else {
-    console.log('[Cookies] WARNING: YOUTUBE_COOKIES not set. Some videos may fail.');
+async function initYoutube() {
+  try {
+    const cookieStr = process.env.YOUTUBE_COOKIES || '';
+    console.log('[Init] Starting Innertube... cookie length:', cookieStr.length);
+    
+    yt = await Innertube.create({
+      cookie: cookieStr || undefined,
+      retrieve_player: false,
+      generate_session_locally: true
+    });
+    
+    ytReady = true;
+    console.log('[Init] Innertube ready ✅');
+  } catch (e) {
+    console.error('[Init] Innertube failed:', e.message);
+    ytReady = false;
   }
-} catch (e) {
-  console.error('[Cookies] Failed to write:', e.message);
 }
+
+// Server start hote hi init karo
+initYoutube();
 
 // ============ HEALTH CHECK ============
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'youtubeHUB proxy',
-    version: '6.0.0 (yt-dlp + cookies)',
-    cookies: cookiesReady ? 'loaded' : 'missing',
+    version: '7.0.0 (youtubei.js)',
+    innertube: ytReady ? 'ready' : 'not ready',
+    cookiesSet: !!process.env.YOUTUBE_COOKIES,
     time: new Date().toISOString()
   });
 });
@@ -54,10 +58,10 @@ app.get('/', (req, res) => {
 // ============ VIDEO ID EXTRACTOR ============
 function extractVideoId(url) {
   if (!url) return null;
-  const match = url.match(
+  const m = url.match(
     /(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|shorts\/|embed\/|v\/))([a-zA-Z0-9_-]{11})/
   );
-  return match ? match[1] : null;
+  return m ? m[1] : null;
 }
 
 // ============================================================
@@ -78,118 +82,125 @@ app.post('/proxy/jobs', async (req, res) => {
 
     console.log('[Job] Creating for:', videoId, '| format:', format);
 
-    // yt-dlp options
-    const ytdlOptions = {
-      dumpSingleJson: true,
-      noCheckCertificates: true,
-      noWarnings: true,
-      preferFreeFormats: true,
-      addHeader: [
-        'referer:youtube.com',
-        'user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-      ]
-    };
-
-    // Cookies add karo agar available hain
-    if (cookiesReady && fs.existsSync(COOKIES_PATH)) {
-      ytdlOptions.cookies = COOKIES_PATH;
-      console.log('[Job] Using cookies');
+    // Agar Innertube ready nahi, to try karo
+    if (!ytReady || !yt) {
+      await initYoutube();
+      if (!ytReady || !yt) {
+        return res.status(503).json({
+          error: 'YouTube client not ready',
+          message: 'Please retry in a moment.'
+        });
+      }
     }
 
+    // ============ Info fetch karo ============
     let info;
     try {
-      info = await youtubedl(url, ytdlOptions);
+      info = await yt.getInfo(videoId);
     } catch (err) {
-      console.error('[Job] yt-dlp error:', err.message);
+      console.error('[Job] getInfo failed:', err.message);
+      // Ek baar phir try karo fresh client se
+      ytReady = false;
+      await initYoutube();
       return res.status(503).json({
-        error: 'YouTube blocked the request',
-        message: cookiesReady
-          ? 'Cookies expire ho gayi hain. Naye cookies export karein.'
-          : 'Cookies set nahi hain. YOUTUBE_COOKIES variable add karein.'
+        error: 'YouTube fetch failed',
+        message: err.message
       });
     }
 
-    const durationSec = parseInt(info.duration, 10) || 0;
-    const videoTitle = info.title || 'Video';
-    const videoThumbnail = info.thumbnail || 'https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg';
+    const basicInfo = info.basic_info || {};
+    const videoTitle = basicInfo.title || 'Video';
+    const videoDuration = basicInfo.duration || 0;
+    const thumbnails = basicInfo.thumbnail || [];
+    const videoThumbnail = thumbnails.length > 0
+      ? thumbnails[0].url
+      : 'https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg';
 
-    let chosenFormatUrl = null;
-    let qualityLabel = '1080p';
+    const streamingData = info.streaming_data || {};
+    const progressiveFormats = streamingData.formats || [];
+    const adaptiveFormats = streamingData.adaptive_formats || [];
+
+    let chosenUrl = null;
+    let qualityLabel = '720p';
     let fileSize = 0;
 
-    try {
-      if (format === 'mp3') {
-        const audioFormats = (info.formats || []).filter(f =>
-          f.vcodec === 'none' && f.acodec !== 'none' && f.url
-        );
-        if (audioFormats.length === 0) throw new Error('No audio format');
+    // ============ Format Selection ============
+    if (format === 'mp3') {
+      // Audio-only formats
+      const audioFormats = adaptiveFormats.filter(f => f.has_audio && !f.has_video);
+      
+      if (audioFormats.length === 0) {
+        return res.status(503).json({ error: 'No audio format available' });
+      }
 
-        const targetBitrate = parseInt((audio_bitrate || '320k').replace('k', ''), 10) || 320;
-        audioFormats.sort((a, b) => (b.abr || 0) - (a.abr || 0));
+      // Sort by bitrate descending
+      audioFormats.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
 
-        let chosen = audioFormats[0];
-        for (const f of audioFormats) {
-          if ((f.abr || 0) <= targetBitrate) {
-            chosen = f;
-            break;
-          }
+      const targetBitrate = parseInt((audio_bitrate || '320k').replace('k', ''), 10) || 320;
+
+      let chosen = audioFormats[0];
+      for (const f of audioFormats) {
+        if ((f.bitrate || 0) <= targetBitrate * 1000) {
           chosen = f;
+          break;
         }
+        chosen = f;
+      }
 
-        chosenFormatUrl = chosen.url;
-        qualityLabel = Math.round(chosen.abr || 128) + ' kbps';
-        fileSize = chosen.filesize || chosen.filesize_approx || 0;
+      chosenUrl = chosen.url;
+      fileSize = parseInt(chosen.content_length || 0, 10);
+      qualityLabel = Math.round((chosen.bitrate || 128000) / 1000) + ' kbps';
+    } else {
+      // Video formats
+      const targetRes = parseInt((max_resolution || '720').replace('p', ''), 10) || 720;
+
+      // Progressive (video+audio) formats preferred
+      let videoFormats = progressiveFormats.filter(f => f.has_video && f.has_audio);
+
+      // Filter by resolution
+      let filtered = videoFormats.filter(f => {
+        const h = parseInt(f.quality_label || '0', 10) || f.height || 0;
+        return h > 0 && h <= targetRes;
+      });
+
+      if (filtered.length > 0) videoFormats = filtered;
+
+      // Sort by resolution desc
+      videoFormats.sort((a, b) => {
+        const ah = parseInt(a.quality_label || '0', 10) || a.height || 0;
+        const bh = parseInt(b.quality_label || '0', 10) || b.height || 0;
+        return bh - ah;
+      });
+
+      if (videoFormats.length > 0) {
+        const chosen = videoFormats[0];
+        chosenUrl = chosen.url;
+        fileSize = parseInt(chosen.content_length || 0, 10);
+        qualityLabel = chosen.quality_label || (chosen.height ? chosen.height + 'p' : targetRes + 'p');
       } else {
-        const targetRes = parseInt((max_resolution || '1080').replace('p', ''), 10) || 1080;
+        // Fallback: video-only adaptive
+        let adaptiveVideo = adaptiveFormats.filter(f => f.has_video && !f.has_audio);
 
-        let progressive = (info.formats || []).filter(f =>
-          f.ext === 'mp4' &&
-          f.vcodec !== 'none' &&
-          f.acodec !== 'none' &&
-          f.url &&
-          (f.height || 0) <= targetRes
-        );
+        filtered = adaptiveVideo.filter(f => {
+          const h = parseInt(f.quality_label || '0', 10) || f.height || 0;
+          return h > 0 && h <= targetRes;
+        });
 
-        if (progressive.length > 0) {
-          progressive.sort((a, b) => (b.height || 0) - (a.height || 0));
-          chosenFormatUrl = progressive[0].url;
-          qualityLabel = progressive[0].height ? progressive[0].height + 'p' : targetRes + 'p';
-          fileSize = progressive[0].filesize || progressive[0].filesize_approx || 0;
-        } else {
-          // Fallback: video-only (highest quality)
-          let videoOnly = (info.formats || []).filter(f =>
-            f.vcodec !== 'none' && f.url && (f.height || 0) <= targetRes
-          );
-          videoOnly.sort((a, b) => (b.height || 0) - (a.height || 0));
+        if (filtered.length > 0) adaptiveVideo = filtered;
 
-          if (videoOnly.length > 0) {
-            chosenFormatUrl = videoOnly[0].url;
-            qualityLabel = videoOnly[0].height ? videoOnly[0].height + 'p' : targetRes + 'p';
-            fileSize = videoOnly[0].filesize || videoOnly[0].filesize_approx || 0;
-          }
-        }
+        adaptiveVideo.sort((a, b) => (b.height || 0) - (a.height || 0));
 
-        if (!chosenFormatUrl) {
-          // Final fallback: any mp4
-          const anyMp4 = (info.formats || []).filter(f => f.ext === 'mp4' && f.url);
-          if (anyMp4.length > 0) {
-            chosenFormatUrl = anyMp4[anyMp4.length - 1].url;
-            qualityLabel = anyMp4[anyMp4.length - 1].height
-              ? anyMp4[anyMp4.length - 1].height + 'p'
-              : '720p';
-          }
-        }
-
-        if (!chosenFormatUrl) {
-          throw new Error('No suitable video format');
+        if (adaptiveVideo.length > 0) {
+          const chosen = adaptiveVideo[0];
+          chosenUrl = chosen.url;
+          fileSize = parseInt(chosen.content_length || 0, 10);
+          qualityLabel = chosen.quality_label || (chosen.height + 'p');
         }
       }
-    } catch (err) {
-      console.error('[Job] Format selection error:', err.message);
-      return res.status(500).json({
-        error: 'No suitable format found',
-        message: err.message
-      });
+
+      if (!chosenUrl) {
+        return res.status(503).json({ error: 'No suitable video format available' });
+      }
     }
 
     const jobId = 'job_' + Date.now() + '_' + Math.random().toString(36).slice(2, 9);
@@ -202,16 +213,15 @@ app.post('/proxy/jobs', async (req, res) => {
       format: format || 'mp4',
       title: videoTitle,
       thumbnail: videoThumbnail,
-      duration: durationSec,
+      duration: videoDuration,
       videoId: videoId,
       quality: qualityLabel,
       size: fileSize,
-      s3_url: chosenFormatUrl,
-      download_url: chosenFormatUrl,
+      s3_url: chosenUrl,
+      download_url: chosenUrl,
       created_at: new Date().toISOString()
     };
 
-    jobs[jobId] = job;
     console.log('[Job] Ready:', jobId, '|', qualityLabel, '|', videoTitle.slice(0, 50));
 
     res.json(job);
@@ -226,11 +236,7 @@ app.post('/proxy/jobs', async (req, res) => {
 // ROUTE 2: GET JOB STATUS
 // ============================================================
 app.get('/proxy/jobs/:id', (req, res) => {
-  const job = jobs[req.params.id];
-  if (!job) {
-    return res.status(404).json({ error: 'Job not found' });
-  }
-  res.json(job);
+  res.json({ id: req.params.id, state: 'completed' });
 });
 
 // ============================================================
@@ -253,8 +259,6 @@ app.get('/proxy/download', async (req, res) => {
   console.log('[Download] Start:', safeFilename);
 
   try {
-    const fetch = require('node-fetch');
-
     const upstreamHeaders = {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       'Accept': '*/*',
@@ -305,8 +309,6 @@ app.get('/proxy/download', async (req, res) => {
       res.send(buffer);
     }
 
-    console.log('[Download] Done:', safeFilename);
-
   } catch (err) {
     console.error('[Download] Fatal:', err);
     if (!res.headersSent) {
@@ -320,9 +322,8 @@ app.get('/proxy/download', async (req, res) => {
 // ============ START SERVER ============
 app.listen(PORT, () => {
   console.log('===========================================');
-  console.log('  youtubeHUB Proxy Server v6.0.0');
-  console.log('  yt-dlp + cookies');
-  console.log('  Cookies:', cookiesReady ? 'LOADED' : 'MISSING');
+  console.log('  youtubeHUB Proxy Server v7.0.0');
+  console.log('  Using youtubei.js (pure JS)');
   console.log('  Port:', PORT);
   console.log('===========================================');
 });
