@@ -1,5 +1,6 @@
 // ============================================================
-// youtubeHUB Proxy Backend v9.0 - cobalt.tools based
+// youtubeHUB Proxy Backend v11.0 - Tornado API
+// Reliable YouTube download via Tornado API
 // ============================================================
 
 const express = require('express');
@@ -16,21 +17,20 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '10mb' }));
 
-// ============ COBALT INSTANCES ============
-const COBALT_INSTANCES = [
-  'https://api.cobalt.tools',
-  'https://co.wuk.sh',
-  'https://cobalt-api.kwiatekmiki.com',
-  'https://api.cobalt.best',
-  'https://cobalt.255x.ru'
-];
+// ============ TORNADO API CONFIG ============
+const TORNADO_API_KEY = process.env.TORNADO_API_KEY || '';
+const TORNADO_BASE_URL = 'https://api.tornadoapi.io';
+
+// In-memory job mapping
+const jobMap = {};
 
 // ============ HEALTH CHECK ============
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'youtubeHUB proxy',
-    version: '9.0.0 (cobalt)',
+    version: '11.0.0 (tornado)',
+    apiKeySet: !!TORNADO_API_KEY,
     time: new Date().toISOString()
   });
 });
@@ -45,7 +45,7 @@ function extractVideoId(url) {
 }
 
 // ============================================================
-// ROUTE 1: CREATE JOB (cobalt API)
+// ROUTE 1: CREATE JOB (Tornado API ko call karta hai)
 // ============================================================
 app.post('/proxy/jobs', async (req, res) => {
   try {
@@ -60,97 +60,82 @@ app.post('/proxy/jobs', async (req, res) => {
       return res.status(400).json({ error: 'Invalid YouTube URL' });
     }
 
-    console.log('[Job] Start:', videoId, '| format:', format);
-
-    // ============ Cobalt request body ============
-    const cobaltBody = {
-      url: url,
-      videoQuality: format === 'mp3' ? '360' : String((max_resolution || '720').replace('p', '')),
-      audioFormat: 'mp3',
-      downloadMode: format === 'mp3' ? 'audio' : 'auto',
-      filenamePattern: 'basic'
-    };
-
-    // ============ Try each cobalt instance ============
-    let cobaltResult = null;
-    let workingInstance = null;
-
-    for (const instance of COBALT_INSTANCES) {
-      try {
-        console.log('[Job] Trying:', instance);
-
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 15000);
-
-        const apiRes = await fetch(instance + '/', {
-          method: 'POST',
-          signal: controller.signal,
-          headers: {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-          },
-          body: JSON.stringify(cobaltBody)
-        });
-        clearTimeout(timeout);
-
-        console.log('[Job] Status:', apiRes.status);
-
-        if (apiRes.ok) {
-          const data = await apiRes.json();
-          console.log('[Job] Response:', JSON.stringify(data).slice(0, 300));
-
-          if (data.status === 'tunnel' || data.status === 'redirect' || data.url) {
-            cobaltResult = data;
-            workingInstance = instance;
-            break;
-          } else if (data.status === 'error') {
-            console.log('[Job] Cobalt error:', data.error && data.error.code);
-          }
-        }
-      } catch (e) {
-        console.log('[Job] Failed:', instance, '-', e.message);
-      }
-    }
-
-    if (!cobaltResult) {
-      return res.status(503).json({
-        error: 'All cobalt instances failed',
-        message: 'Please try again in a moment.'
+    if (!TORNADO_API_KEY) {
+      return res.status(500).json({
+        error: 'Tornado API key not set',
+        message: 'TORNADO_API_KEY environment variable missing'
       });
     }
 
-    // Cobalt tunnel URL alag hoti hai — usay apne download proxy se serve karenge
-    const downloadUrl = cobaltResult.url;
+    console.log('[Job] Creating for:', videoId, '| format:', format);
 
-    // Basic title fetch (YouTube thumbnail se)
-    const videoTitle = 'Video';
-    const videoThumbnail = 'https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg';
-
-    const jobId = 'job_' + Date.now() + '_' + Math.random().toString(36).slice(2, 9);
-
-    const job = {
-      id: jobId,
-      state: 'completed',
-      progress: 100,
+    // ============ Tornado request body banao ============
+    const tornadoBody = {
       url: url,
-      format: format || 'mp4',
-      title: videoTitle,
-      thumbnail: videoThumbnail,
-      duration: 0,
-      videoId: videoId,
-      quality: (max_resolution || '720') + 'p',
-      size: 0,
-      s3_url: downloadUrl,
-      download_url: downloadUrl,
-      filename: cobaltResult.filename || ('video.' + (format === 'mp3' ? 'mp3' : 'mp4')),
-      source: workingInstance,
-      created_at: new Date().toISOString()
+      filename: 'youtubehub_video'
     };
 
-    console.log('[Job] Ready ✅:', jobId, '|', downloadUrl.slice(0, 80));
+    if (format === 'mp3') {
+      tornadoBody.audio_only = true;
+      tornadoBody.format = 'mp3';
+      tornadoBody.audio_bitrate = (audio_bitrate || '320').replace('k', '') + 'k';
+    } else {
+      tornadoBody.format = 'mp4';
+      tornadoBody.max_resolution = (max_resolution || '1080').replace('p', '') + 'p';
+    }
 
-    res.json(job);
+    console.log('[Job] Tornado body:', JSON.stringify(tornadoBody));
+
+    // ============ Tornado ko call karo ============
+    const response = await fetch(TORNADO_BASE_URL + '/jobs', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': TORNADO_API_KEY
+      },
+      body: JSON.stringify(tornadoBody)
+    });
+
+    const data = await response.json();
+    console.log('[Job] Tornado response:', JSON.stringify(data).slice(0, 300));
+
+    if (!response.ok) {
+      return res.status(response.status).json({
+        error: 'Tornado API error',
+        message: data.error || data.message || 'HTTP ' + response.status
+      });
+    }
+
+    const tornadoJobId = data.job_id;
+    if (!tornadoJobId) {
+      return res.status(500).json({ error: 'No job_id returned from Tornado' });
+    }
+
+    // ============ Internal job ID banao ============
+    const internalId = 'job_' + Date.now() + '_' + Math.random().toString(36).slice(2, 9);
+
+    jobMap[internalId] = {
+      tornadoJobId: tornadoJobId,
+      videoId: videoId,
+      format: format || 'mp4',
+      quality: max_resolution || '1080p',
+      createdAt: Date.now()
+    };
+
+    console.log('[Job] Created:', internalId, '->', tornadoJobId);
+
+    // Frontend ko turant response do
+    res.json({
+      id: internalId,
+      job_id: internalId,
+      videoId: videoId,
+      state: 'pending',
+      status: 'pending',
+      progress: 0,
+      title: 'Processing...',
+      format: format || 'mp4',
+      quality: max_resolution || '1080p'
+    });
 
   } catch (err) {
     console.error('[Job] Fatal:', err);
@@ -159,10 +144,93 @@ app.post('/proxy/jobs', async (req, res) => {
 });
 
 // ============================================================
-// ROUTE 2: GET JOB STATUS
+// ROUTE 2: GET JOB STATUS (Tornado se status check karta hai)
 // ============================================================
-app.get('/proxy/jobs/:id', (req, res) => {
-  res.json({ id: req.params.id, state: 'completed' });
+app.get('/proxy/jobs/:id', async (req, res) => {
+  try {
+    const internalId = req.params.id;
+    const jobInfo = jobMap[internalId];
+
+    if (!jobInfo) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    // Tornado se status fetch karo
+    const response = await fetch(TORNADO_BASE_URL + '/jobs/' + jobInfo.tornadoJobId, {
+      method: 'GET',
+      headers: {
+        'x-api-key': TORNADO_API_KEY
+      }
+    });
+
+    if (!response.ok) {
+      return res.status(response.status).json({
+        error: 'Tornado status fetch failed',
+        state: 'failed',
+        status: 'failed'
+      });
+    }
+
+    const data = await response.json();
+    console.log('[Status]', internalId, '->', data.status, '| step:', data.step);
+
+    // ============ Tornado status → Frontend format ============
+    let frontendState = 'processing';
+    let progress = 50;
+
+    const tornadoStatus = String(data.status || '').toLowerCase();
+
+    if (tornadoStatus === 'completed') {
+      frontendState = 'completed';
+      progress = 100;
+    } else if (tornadoStatus === 'failed' || tornadoStatus === 'error') {
+      frontendState = 'failed';
+      progress = 0;
+    } else if (tornadoStatus === 'pending') {
+      frontendState = 'pending';
+      progress = 10;
+    } else if (tornadoStatus === 'processing') {
+      frontendState = 'processing';
+      progress = data.step === 'Downloading' ? 40 :
+                  data.step === 'Muxing' ? 70 :
+                  data.step === 'Uploading' ? 90 : 30;
+    }
+
+    // ============ Response banao ============
+    const result = {
+      id: internalId,
+      job_id: internalId,
+      state: frontendState,
+      status: frontendState,
+      progress: progress,
+      videoId: jobInfo.videoId,
+      title: data.title || 'Video',
+      quality: data.actual_quality || jobInfo.quality,
+      format: jobInfo.format,
+      size: data.file_size || 0,
+      duration: 0
+    };
+
+    if (frontendState === 'completed' && data.s3_url) {
+      result.s3_url = data.s3_url;
+      result.download_url = data.s3_url;
+    }
+
+    if (frontendState === 'failed') {
+      result.message = data.error || 'Download failed';
+      result.error = data.error || 'Download failed';
+    }
+
+    res.json(result);
+
+  } catch (err) {
+    console.error('[Status] Fatal:', err);
+    res.status(500).json({
+      error: err.message,
+      state: 'failed',
+      status: 'failed'
+    });
+  }
 });
 
 // ============================================================
@@ -183,13 +251,11 @@ app.get('/proxy/download', async (req, res) => {
     .trim() || 'video.mp4';
 
   console.log('[Download] Start:', safeFilename);
-  console.log('[Download] URL:', decodedUrl.slice(0, 100));
 
   try {
     const upstreamHeaders = {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept': '*/*',
-      'Accept-Language': 'en-US,en;q=0.9'
+      'Accept': '*/*'
     };
 
     if (req.headers.range) {
@@ -234,6 +300,8 @@ app.get('/proxy/download', async (req, res) => {
       res.send(buffer);
     }
 
+    console.log('[Download] Done:', safeFilename);
+
   } catch (err) {
     console.error('[Download] Fatal:', err);
     if (!res.headersSent) {
@@ -247,8 +315,9 @@ app.get('/proxy/download', async (req, res) => {
 // ============ START SERVER ============
 app.listen(PORT, () => {
   console.log('===========================================');
-  console.log('  youtubeHUB Proxy Server v9.0.0');
-  console.log('  Using cobalt.tools API');
+  console.log('  youtubeHUB Proxy Server v11.0.0');
+  console.log('  Using Tornado API');
+  console.log('  API Key:', TORNADO_API_KEY ? 'SET' : 'NOT SET');
   console.log('  Port:', PORT);
   console.log('===========================================');
 });
