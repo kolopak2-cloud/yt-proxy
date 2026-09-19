@@ -1,16 +1,15 @@
 // ============================================================
-// youtubeHUB Proxy Backend - Complete Server
-// Railway-ready | Piped API based | Silent Download
+// youtubeHUB Proxy Backend v3.0 - ytdl-core based
 // ============================================================
 
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
+const ytdl = require('@distube/ytdl-core');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ============ MIDDLEWARE ============
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'OPTIONS'],
@@ -18,7 +17,6 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '10mb' }));
 
-// In-memory job storage
 const jobs = {};
 
 // ============ HEALTH CHECK ============
@@ -26,7 +24,7 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'youtubeHUB proxy',
-    version: '2.0.0',
+    version: '3.0.0',
     time: new Date().toISOString()
   });
 });
@@ -41,7 +39,7 @@ function extractVideoId(url) {
 }
 
 // ============================================================
-// ROUTE 1: CREATE JOB (Video info fetch karta hai)
+// ROUTE 1: CREATE JOB (ytdl-core se video info)
 // ============================================================
 app.post('/proxy/jobs', async (req, res) => {
   try {
@@ -58,135 +56,84 @@ app.post('/proxy/jobs', async (req, res) => {
 
     console.log('[Job] Creating for:', videoId, '| format:', format, '| max_res:', max_resolution);
 
-    let downloadUrl = null;
-    let videoTitle = 'Video';
-    let videoDuration = 0;
-    let videoThumbnail = 'https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg';
-    let fileSize = 0;
-    let qualityLabel = (max_resolution || '1080') + 'p';
-
-    // Multiple Piped instances try karo (redundancy ke liye)
-    const pipedInstances = [
-      'https://pipedapi.kavin.rocks',
-      'https://api.piped.yt',
-      'https://pipedapi.adminforge.de',
-      'https://pipedapi.reallyaweso.me',
-      'https://pipedapi.drgns.space'
-    ];
-
-    let pipedData = null;
-    for (const instance of pipedInstances) {
-      try {
-        console.log('[Job] Trying:', instance);
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 8000);
-
-        const pipedRes = await fetch(instance + '/streams/' + videoId, {
-          signal: controller.signal,
+    // ============ ytdl-core se info fetch karo ============
+    let info;
+    try {
+      info = await ytdl.getInfo(videoId, {
+        requestOptions: {
           headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9'
           }
-        });
-        clearTimeout(timeout);
-
-        if (pipedRes.ok) {
-          pipedData = await pipedRes.json();
-          console.log('[Job] Success via:', instance);
-          break;
         }
-      } catch (e) {
-        console.log('[Job] Failed:', instance, '-', e.message);
-      }
-    }
-
-    if (!pipedData) {
-      console.error('[Job] All Piped instances failed');
+      });
+    } catch (err) {
+      console.error('[Job] ytdl getInfo failed:', err.message);
       return res.status(503).json({
         error: 'Unable to fetch video info',
-        message: 'YouTube source unavailable. Please try again in a moment.'
+        message: 'YouTube blocked the request. Try again in a moment.'
       });
     }
 
-    videoTitle = pipedData.title || 'Video';
-    videoDuration = pipedData.duration || 0;
-    videoThumbnail = pipedData.thumbnailUrl || videoThumbnail;
+    const durationSec = parseInt(info.videoDetails.lengthSeconds, 10) || 0;
+    const videoTitle = info.videoDetails.title || 'Video';
+    const videoThumbnail = (info.videoDetails.thumbnails.slice(-1)[0] || {}).url
+                        || 'https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg';
 
-    // ============ MP3 / Audio ============
-    if (format === 'mp3') {
-      const audioStreams = (pipedData.audioStreams || []).filter(s => s.url);
-      
-      if (audioStreams.length === 0) {
-        console.error('[Job] No audio streams available');
-        return res.status(503).json({ error: 'No audio stream found' });
-      }
+    let chosenFormat;
+    let qualityLabel = '1080p';
 
-      const targetBitrate = parseInt((audio_bitrate || '320k').replace('k', ''), 10) || 320;
-      audioStreams.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-
-      let chosen = audioStreams[0];
-      for (const s of audioStreams) {
-        if ((s.bitrate || 0) >= targetBitrate * 1000) {
-          chosen = s;
-          break;
-        }
-        chosen = s;
-      }
-
-      downloadUrl = chosen.url;
-      fileSize = chosen.contentLength || 0;
-      qualityLabel = Math.round((chosen.bitrate || 128000) / 1000) + ' kbps';
-    } 
-    // ============ Video (MP4) ============
-    else {
-      const videoStreams = (pipedData.videoStreams || []).filter(s => 
-        s.url && s.format === 'MPEG_4'
-      );
-
-      if (videoStreams.length === 0) {
-        // Fallback: koi bhi video stream
-        const fallback = (pipedData.videoStreams || []).filter(s => s.url);
-        videoStreams.push(...fallback);
-      }
-
-      if (videoStreams.length === 0) {
-        console.error('[Job] No video streams available');
-        return res.status(503).json({ error: 'No video stream found' });
-      }
-
-      const targetRes = parseInt((max_resolution || '1080').replace('p', ''), 10) || 1080;
-
-      // Filter by resolution (progressive streams with audio preferred)
-      let filtered = videoStreams.filter(s => {
-        const h = parseInt(s.quality || '0', 10);
-        return h <= targetRes && h > 0 && s.videoOnly === false;
-      });
-
-      if (filtered.length === 0) {
-        filtered = videoStreams.filter(s => {
-          const h = parseInt(s.quality || '0', 10);
-          return h <= targetRes && h > 0;
+    // ============ Format Selection ============
+    try {
+      if (format === 'mp3') {
+        chosenFormat = ytdl.chooseFormat(info.formats, {
+          quality: 'highestaudio',
+          filter: 'audioonly'
         });
+        if (!chosenFormat) throw new Error('No audio format');
+        qualityLabel = Math.round((chosenFormat.audioBitrate || 128)) + ' kbps';
+      } else {
+        const targetRes = parseInt((max_resolution || '1080').replace('p', ''), 10) || 1080;
+
+        // Filter progressive (audio+video) MP4 formats
+        const mp4Progressive = info.formats.filter(f =>
+          f.container === 'mp4' &&
+          f.hasVideo &&
+          f.hasAudio &&
+          (f.height || 0) <= targetRes
+        );
+
+        if (mp4Progressive.length > 0) {
+          // Sort by height desc
+          mp4Progressive.sort((a, b) => (b.height || 0) - (a.height || 0));
+          chosenFormat = mp4Progressive[0];
+        } else {
+          // Fallback: any mp4 with video
+          const mp4Any = info.formats.filter(f => f.container === 'mp4' && f.hasVideo);
+          mp4Any.sort((a, b) => (b.height || 0) - (a.height || 0));
+          chosenFormat = mp4Any[0];
+        }
+
+        if (!chosenFormat) {
+          chosenFormat = ytdl.chooseFormat(info.formats, { quality: 'highest' });
+        }
+
+        if (!chosenFormat) throw new Error('No suitable video format');
+        qualityLabel = chosenFormat.qualityLabel || (chosenFormat.height ? chosenFormat.height + 'p' : '720p');
       }
-
-      if (filtered.length === 0) filtered = videoStreams;
-
-      // Sort by height desc
-      filtered.sort((a, b) => {
-        const ah = parseInt(a.quality || '0', 10);
-        const bh = parseInt(b.quality || '0', 10);
-        return bh - ah;
+    } catch (err) {
+      console.error('[Job] Format selection error:', err.message);
+      return res.status(500).json({
+        error: 'No suitable format found',
+        message: err.message
       });
-
-      const chosen = filtered[0];
-      downloadUrl = chosen.url;
-      fileSize = chosen.contentLength || 0;
-      qualityLabel = chosen.quality ? chosen.quality + 'p' : targetRes + 'p';
     }
 
-    if (!downloadUrl) {
-      return res.status(503).json({ error: 'No download URL available' });
+    if (!chosenFormat || !chosenFormat.url) {
+      return res.status(500).json({ error: 'No download URL available' });
     }
 
+    const fileSize = parseInt(chosenFormat.contentLength || 0, 10) || 0;
     const jobId = 'job_' + Date.now() + '_' + Math.random().toString(36).slice(2, 9);
 
     const job = {
@@ -197,12 +144,12 @@ app.post('/proxy/jobs', async (req, res) => {
       format: format || 'mp4',
       title: videoTitle,
       thumbnail: videoThumbnail,
-      duration: videoDuration,
+      duration: durationSec,
       videoId: videoId,
       quality: qualityLabel,
       size: fileSize,
-      s3_url: downloadUrl,
-      download_url: downloadUrl,
+      s3_url: chosenFormat.url,
+      download_url: chosenFormat.url,
       created_at: new Date().toISOString()
     };
 
@@ -229,8 +176,7 @@ app.get('/proxy/jobs/:id', (req, res) => {
 });
 
 // ============================================================
-// ROUTE 3: ⭐ DOWNLOAD PROXY (Most Important!)
-// YouTube CDN se file lekar client ko bhejta hai (CORS bypass)
+// ROUTE 3: DOWNLOAD PROXY
 // ============================================================
 app.get('/proxy/download', async (req, res) => {
   const fileUrl = req.query.url;
@@ -247,13 +193,14 @@ app.get('/proxy/download', async (req, res) => {
     .trim() || 'video.mp4';
 
   console.log('[Download] Start:', safeFilename);
-  console.log('[Download] From:', decodedUrl.slice(0, 100) + '...');
 
   try {
     const upstreamHeaders = {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       'Accept': '*/*',
-      'Accept-Language': 'en-US,en;q=0.9'
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Referer': 'https://www.youtube.com/',
+      'Origin': 'https://www.youtube.com'
     };
 
     if (req.headers.range) {
@@ -271,7 +218,6 @@ app.get('/proxy/download', async (req, res) => {
       return res.status(response.status).send('Upstream error: ' + response.status);
     }
 
-    // Force browser to download (not open in tab)
     res.setHeader('Content-Disposition', 'attachment; filename="' + safeFilename + '"');
     res.setHeader('Content-Type', response.headers.get('content-type') || 'application/octet-stream');
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -287,7 +233,6 @@ app.get('/proxy/download', async (req, res) => {
       res.status(206);
     }
 
-    // node-fetch v2: body stream ko pipe karo
     if (response.body && typeof response.body.pipe === 'function') {
       response.body.pipe(res);
       response.body.on('error', (err) => {
@@ -300,7 +245,7 @@ app.get('/proxy/download', async (req, res) => {
       res.send(buffer);
     }
 
-    console.log('[Download] Streaming:', safeFilename);
+    console.log('[Download] Done:', safeFilename);
 
   } catch (err) {
     console.error('[Download] Fatal:', err);
@@ -315,13 +260,8 @@ app.get('/proxy/download', async (req, res) => {
 // ============ START SERVER ============
 app.listen(PORT, () => {
   console.log('===========================================');
-  console.log('  youtubeHUB Proxy Server v2.0.0');
+  console.log('  youtubeHUB Proxy Server v3.0.0');
   console.log('  Running on port ' + PORT);
-  console.log('-------------------------------------------');
-  console.log('  Endpoints:');
-  console.log('  GET  /');
-  console.log('  POST /proxy/jobs');
-  console.log('  GET  /proxy/jobs/:id');
-  console.log('  GET  /proxy/download?url=...&filename=...');
+  console.log('  Using @distube/ytdl-core');
   console.log('===========================================');
 });
