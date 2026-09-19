@@ -1,7 +1,7 @@
 {
   "name": "yt-proxy",
-  "version": "9.0.0",
-  "description": "Proxy for youtubeHUB using cobalt",
+  "version": "11.0.0",
+  "description": "CORS Proxy for youtubeHUB using Tornado API",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
