@@ -1,10 +1,13 @@
 // ============================================================
-// youtubeHUB Proxy Backend v5.0 - untube based
+// youtubeHUB Proxy Backend v6.0 - yt-dlp + Cookies
+// 100% reliable YouTube download
 // ============================================================
 
 const express = require('express');
 const cors = require('cors');
-const untube = require('untube');
+const youtubedl = require('youtube-dl-exec');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -18,12 +21,32 @@ app.use(express.json({ limit: '10mb' }));
 
 const jobs = {};
 
+// ============================================================
+// COOKIES SETUP - Environment variable se read karo
+// ============================================================
+const COOKIES_PATH = '/tmp/cookies.txt';
+let cookiesReady = false;
+
+try {
+  if (process.env.YOUTUBE_COOKIES) {
+    // Railway variable se cookies file banao
+    fs.writeFileSync(COOKIES_PATH, process.env.YOUTUBE_COOKIES, 'utf8');
+    cookiesReady = true;
+    console.log('[Cookies] Loaded from environment variable');
+  } else {
+    console.log('[Cookies] WARNING: YOUTUBE_COOKIES not set. Some videos may fail.');
+  }
+} catch (e) {
+  console.error('[Cookies] Failed to write:', e.message);
+}
+
 // ============ HEALTH CHECK ============
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'youtubeHUB proxy',
-    version: '5.0.0 (untube)',
+    version: '6.0.0 (yt-dlp + cookies)',
+    cookies: cookiesReady ? 'loaded' : 'missing',
     time: new Date().toISOString()
   });
 });
@@ -38,7 +61,7 @@ function extractVideoId(url) {
 }
 
 // ============================================================
-// ROUTE 1: CREATE JOB (untube se video info)
+// ROUTE 1: CREATE JOB
 // ============================================================
 app.post('/proxy/jobs', async (req, res) => {
   try {
@@ -55,15 +78,34 @@ app.post('/proxy/jobs', async (req, res) => {
 
     console.log('[Job] Creating for:', videoId, '| format:', format);
 
-    // ============ untube se info fetch karo ============
+    // yt-dlp options
+    const ytdlOptions = {
+      dumpSingleJson: true,
+      noCheckCertificates: true,
+      noWarnings: true,
+      preferFreeFormats: true,
+      addHeader: [
+        'referer:youtube.com',
+        'user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      ]
+    };
+
+    // Cookies add karo agar available hain
+    if (cookiesReady && fs.existsSync(COOKIES_PATH)) {
+      ytdlOptions.cookies = COOKIES_PATH;
+      console.log('[Job] Using cookies');
+    }
+
     let info;
     try {
-      info = await untube.getVideoInfo(videoId);
+      info = await youtubedl(url, ytdlOptions);
     } catch (err) {
-      console.error('[Job] untube getInfo failed:', err.message);
+      console.error('[Job] yt-dlp error:', err.message);
       return res.status(503).json({
-        error: 'Unable to fetch video info',
-        message: 'YouTube blocked the request. Try again in a moment.'
+        error: 'YouTube blocked the request',
+        message: cookiesReady
+          ? 'Cookies expire ho gayi hain. Naye cookies export karein.'
+          : 'Cookies set nahi hain. YOUTUBE_COOKIES variable add karein.'
       });
     }
 
@@ -75,10 +117,11 @@ app.post('/proxy/jobs', async (req, res) => {
     let qualityLabel = '1080p';
     let fileSize = 0;
 
-    // ============ Format Selection ============
     try {
       if (format === 'mp3') {
-        const audioFormats = (info.formats || []).filter(f => f.vcodec === 'none' && f.acodec !== 'none');
+        const audioFormats = (info.formats || []).filter(f =>
+          f.vcodec === 'none' && f.acodec !== 'none' && f.url
+        );
         if (audioFormats.length === 0) throw new Error('No audio format');
 
         const targetBitrate = parseInt((audio_bitrate || '320k').replace('k', ''), 10) || 320;
@@ -86,7 +129,7 @@ app.post('/proxy/jobs', async (req, res) => {
 
         let chosen = audioFormats[0];
         for (const f of audioFormats) {
-          if ((f.abr || 0) >= targetBitrate) {
+          if ((f.abr || 0) <= targetBitrate) {
             chosen = f;
             break;
           }
@@ -99,11 +142,11 @@ app.post('/proxy/jobs', async (req, res) => {
       } else {
         const targetRes = parseInt((max_resolution || '1080').replace('p', ''), 10) || 1080;
 
-        // Progressive streams (audio+video combined)
         let progressive = (info.formats || []).filter(f =>
           f.ext === 'mp4' &&
           f.vcodec !== 'none' &&
           f.acodec !== 'none' &&
+          f.url &&
           (f.height || 0) <= targetRes
         );
 
@@ -113,8 +156,9 @@ app.post('/proxy/jobs', async (req, res) => {
           qualityLabel = progressive[0].height ? progressive[0].height + 'p' : targetRes + 'p';
           fileSize = progressive[0].filesize || progressive[0].filesize_approx || 0;
         } else {
-          const videoOnly = (info.formats || []).filter(f =>
-            f.vcodec !== 'none' && (f.height || 0) <= targetRes
+          // Fallback: video-only (highest quality)
+          let videoOnly = (info.formats || []).filter(f =>
+            f.vcodec !== 'none' && f.url && (f.height || 0) <= targetRes
           );
           videoOnly.sort((a, b) => (b.height || 0) - (a.height || 0));
 
@@ -122,6 +166,17 @@ app.post('/proxy/jobs', async (req, res) => {
             chosenFormatUrl = videoOnly[0].url;
             qualityLabel = videoOnly[0].height ? videoOnly[0].height + 'p' : targetRes + 'p';
             fileSize = videoOnly[0].filesize || videoOnly[0].filesize_approx || 0;
+          }
+        }
+
+        if (!chosenFormatUrl) {
+          // Final fallback: any mp4
+          const anyMp4 = (info.formats || []).filter(f => f.ext === 'mp4' && f.url);
+          if (anyMp4.length > 0) {
+            chosenFormatUrl = anyMp4[anyMp4.length - 1].url;
+            qualityLabel = anyMp4[anyMp4.length - 1].height
+              ? anyMp4[anyMp4.length - 1].height + 'p'
+              : '720p';
           }
         }
 
@@ -265,8 +320,9 @@ app.get('/proxy/download', async (req, res) => {
 // ============ START SERVER ============
 app.listen(PORT, () => {
   console.log('===========================================');
-  console.log('  youtubeHUB Proxy Server v5.0.0');
-  console.log('  Using untube (yt-dlp port)');
-  console.log('  Running on port ' + PORT);
+  console.log('  youtubeHUB Proxy Server v6.0.0');
+  console.log('  yt-dlp + cookies');
+  console.log('  Cookies:', cookiesReady ? 'LOADED' : 'MISSING');
+  console.log('  Port:', PORT);
   console.log('===========================================');
 });
