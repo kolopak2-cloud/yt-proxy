@@ -1,6 +1,5 @@
 // ============================================================
-// youtubeHUB Proxy Backend v11.0 - Tornado API
-// Reliable YouTube download via Tornado API
+// youtubeHUB Proxy Backend v11.1 - Tornado API (fixed)
 // ============================================================
 
 const express = require('express');
@@ -17,25 +16,21 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '10mb' }));
 
-// ============ TORNADO API CONFIG ============
 const TORNADO_API_KEY = process.env.TORNADO_API_KEY || '';
 const TORNADO_BASE_URL = 'https://api.tornadoapi.io';
 
-// In-memory job mapping
 const jobMap = {};
 
-// ============ HEALTH CHECK ============
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'youtubeHUB proxy',
-    version: '11.0.0 (tornado)',
+    version: '11.1.0 (tornado)',
     apiKeySet: !!TORNADO_API_KEY,
     time: new Date().toISOString()
   });
 });
 
-// ============ VIDEO ID EXTRACTOR ============
 function extractVideoId(url) {
   if (!url) return null;
   const m = url.match(
@@ -44,21 +39,14 @@ function extractVideoId(url) {
   return m ? m[1] : null;
 }
 
-// ============================================================
-// ROUTE 1: CREATE JOB (Tornado API ko call karta hai)
-// ============================================================
 app.post('/proxy/jobs', async (req, res) => {
   try {
     const { url, format, max_resolution, audio_bitrate } = req.body;
 
-    if (!url) {
-      return res.status(400).json({ error: 'url is required' });
-    }
+    if (!url) return res.status(400).json({ error: 'url is required' });
 
     const videoId = extractVideoId(url);
-    if (!videoId) {
-      return res.status(400).json({ error: 'Invalid YouTube URL' });
-    }
+    if (!videoId) return res.status(400).json({ error: 'Invalid YouTube URL' });
 
     if (!TORNADO_API_KEY) {
       return res.status(500).json({
@@ -69,7 +57,6 @@ app.post('/proxy/jobs', async (req, res) => {
 
     console.log('[Job] Creating for:', videoId, '| format:', format);
 
-    // ============ Tornado request body banao ============
     const tornadoBody = {
       url: url,
       filename: 'youtubehub_video'
@@ -81,12 +68,15 @@ app.post('/proxy/jobs', async (req, res) => {
       tornadoBody.audio_bitrate = (audio_bitrate || '320').replace('k', '') + 'k';
     } else {
       tornadoBody.format = 'mp4';
-      tornadoBody.max_resolution = (max_resolution || '1080').replace('p', '') + 'p';
+      // ⭐ YEH LINE FIX KI HAI — bina "p" ke
+      const resNum = (max_resolution || '1080').replace('p', '').trim();
+      // Valid options check karo
+      const validRes = ['best', 'lowest', '2160', '1440', '1080', '720', '480', '360', '240', '144'];
+      tornadoBody.max_resolution = validRes.includes(resNum) ? resNum : '1080';
     }
 
     console.log('[Job] Tornado body:', JSON.stringify(tornadoBody));
 
-    // ============ Tornado ko call karo ============
     const response = await fetch(TORNADO_BASE_URL + '/jobs', {
       method: 'POST',
       headers: {
@@ -111,7 +101,6 @@ app.post('/proxy/jobs', async (req, res) => {
       return res.status(500).json({ error: 'No job_id returned from Tornado' });
     }
 
-    // ============ Internal job ID banao ============
     const internalId = 'job_' + Date.now() + '_' + Math.random().toString(36).slice(2, 9);
 
     jobMap[internalId] = {
@@ -124,7 +113,6 @@ app.post('/proxy/jobs', async (req, res) => {
 
     console.log('[Job] Created:', internalId, '->', tornadoJobId);
 
-    // Frontend ko turant response do
     res.json({
       id: internalId,
       job_id: internalId,
@@ -143,9 +131,6 @@ app.post('/proxy/jobs', async (req, res) => {
   }
 });
 
-// ============================================================
-// ROUTE 2: GET JOB STATUS (Tornado se status check karta hai)
-// ============================================================
 app.get('/proxy/jobs/:id', async (req, res) => {
   try {
     const internalId = req.params.id;
@@ -155,7 +140,6 @@ app.get('/proxy/jobs/:id', async (req, res) => {
       return res.status(404).json({ error: 'Job not found' });
     }
 
-    // Tornado se status fetch karo
     const response = await fetch(TORNADO_BASE_URL + '/jobs/' + jobInfo.tornadoJobId, {
       method: 'GET',
       headers: {
@@ -174,7 +158,6 @@ app.get('/proxy/jobs/:id', async (req, res) => {
     const data = await response.json();
     console.log('[Status]', internalId, '->', data.status, '| step:', data.step);
 
-    // ============ Tornado status → Frontend format ============
     let frontendState = 'processing';
     let progress = 50;
 
@@ -196,7 +179,6 @@ app.get('/proxy/jobs/:id', async (req, res) => {
                   data.step === 'Uploading' ? 90 : 30;
     }
 
-    // ============ Response banao ============
     const result = {
       id: internalId,
       job_id: internalId,
@@ -233,16 +215,11 @@ app.get('/proxy/jobs/:id', async (req, res) => {
   }
 });
 
-// ============================================================
-// ROUTE 3: DOWNLOAD PROXY
-// ============================================================
 app.get('/proxy/download', async (req, res) => {
   const fileUrl = req.query.url;
   const filename = req.query.filename || 'video.mp4';
 
-  if (!fileUrl) {
-    return res.status(400).send('Missing url parameter');
-  }
+  if (!fileUrl) return res.status(400).send('Missing url parameter');
 
   const decodedUrl = decodeURIComponent(fileUrl);
   const safeFilename = filename
@@ -258,9 +235,7 @@ app.get('/proxy/download', async (req, res) => {
       'Accept': '*/*'
     };
 
-    if (req.headers.range) {
-      upstreamHeaders['Range'] = req.headers.range;
-    }
+    if (req.headers.range) upstreamHeaders['Range'] = req.headers.range;
 
     const response = await fetch(decodedUrl, {
       method: 'GET',
@@ -269,7 +244,6 @@ app.get('/proxy/download', async (req, res) => {
     });
 
     if (!response.ok && response.status !== 206) {
-      console.error('[Download] Upstream error:', response.status);
       return res.status(response.status).send('Upstream error: ' + response.status);
     }
 
@@ -277,7 +251,6 @@ app.get('/proxy/download', async (req, res) => {
     res.setHeader('Content-Type', response.headers.get('content-type') || 'application/octet-stream');
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length, Content-Range');
-    res.setHeader('Cache-Control', 'no-cache');
 
     const contentLength = response.headers.get('content-length');
     if (contentLength) res.setHeader('Content-Length', contentLength);
@@ -300,23 +273,17 @@ app.get('/proxy/download', async (req, res) => {
       res.send(buffer);
     }
 
-    console.log('[Download] Done:', safeFilename);
-
   } catch (err) {
     console.error('[Download] Fatal:', err);
-    if (!res.headersSent) {
-      res.status(500).send('Download failed: ' + err.message);
-    } else {
-      res.end();
-    }
+    if (!res.headersSent) res.status(500).send('Download failed: ' + err.message);
+    else res.end();
   }
 });
 
-// ============ START SERVER ============
 app.listen(PORT, () => {
   console.log('===========================================');
-  console.log('  youtubeHUB Proxy Server v11.0.0');
-  console.log('  Using Tornado API');
+  console.log('  youtubeHUB Proxy Server v11.1.0');
+  console.log('  Using Tornado API (fixed resolution)');
   console.log('  API Key:', TORNADO_API_KEY ? 'SET' : 'NOT SET');
   console.log('  Port:', PORT);
   console.log('===========================================');
