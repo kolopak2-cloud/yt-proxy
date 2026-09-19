@@ -1,11 +1,10 @@
 // ============================================================
-// youtubeHUB Proxy Backend v3.0 - ytdl-core based
+// youtubeHUB Proxy Backend v3.0 - yt-dlp based
 // ============================================================
 
 const express = require('express');
 const cors = require('cors');
-const fetch = require('node-fetch');
-const ytdl = require('@distube/ytdl-core');
+const youtubedl = require('youtube-dl-exec');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -24,7 +23,7 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'youtubeHUB proxy',
-    version: '3.0.0',
+    version: '3.0.0 (yt-dlp)',
     time: new Date().toISOString()
   });
 });
@@ -39,7 +38,7 @@ function extractVideoId(url) {
 }
 
 // ============================================================
-// ROUTE 1: CREATE JOB (ytdl-core se video info)
+// ROUTE 1: CREATE JOB (yt-dlp se video info)
 // ============================================================
 app.post('/proxy/jobs', async (req, res) => {
   try {
@@ -56,70 +55,94 @@ app.post('/proxy/jobs', async (req, res) => {
 
     console.log('[Job] Creating for:', videoId, '| format:', format, '| max_res:', max_resolution);
 
-    // ============ ytdl-core se info fetch karo ============
+    // ============ yt-dlp se info fetch karo ============
     let info;
     try {
-      info = await ytdl.getInfo(videoId, {
-        requestOptions: {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept-Language': 'en-US,en;q=0.9'
-          }
-        }
+      // yt-dlp ko JSON format mein output dene ka kehte hain
+      info = await youtubedl(url, {
+        dumpSingleJson: true,
+        noCheckCertificates: true,
+        noWarnings: true,
+        preferFreeFormats: true,
+        addHeader: [
+          'referer:youtube.com',
+          'user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        ]
       });
     } catch (err) {
-      console.error('[Job] ytdl getInfo failed:', err.message);
+      console.error('[Job] yt-dlp getInfo failed:', err.message);
       return res.status(503).json({
         error: 'Unable to fetch video info',
         message: 'YouTube blocked the request. Try again in a moment.'
       });
     }
 
-    const durationSec = parseInt(info.videoDetails.lengthSeconds, 10) || 0;
-    const videoTitle = info.videoDetails.title || 'Video';
-    const videoThumbnail = (info.videoDetails.thumbnails.slice(-1)[0] || {}).url
-                        || 'https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg';
+    const durationSec = parseInt(info.duration, 10) || 0;
+    const videoTitle = info.title || 'Video';
+    const videoThumbnail = info.thumbnail || 'https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg';
 
-    let chosenFormat;
+    let chosenFormatUrl = null;
     let qualityLabel = '1080p';
+    let fileSize = 0;
 
-    // ============ Format Selection ============
+    // ============ Format Selection with yt-dlp ============
     try {
       if (format === 'mp3') {
-        chosenFormat = ytdl.chooseFormat(info.formats, {
-          quality: 'highestaudio',
-          filter: 'audioonly'
-        });
-        if (!chosenFormat) throw new Error('No audio format');
-        qualityLabel = Math.round((chosenFormat.audioBitrate || 128)) + ' kbps';
+        // MP3 ke liye best audio format dhoondo
+        const audioFormats = info.formats.filter(f => f.vcodec === 'none' && f.acodec !== 'none');
+        if (audioFormats.length === 0) throw new Error('No audio format');
+
+        // Bitrate ke hisaab se best format choose karo
+        const targetBitrate = parseInt((audio_bitrate || '320k').replace('k', ''), 10) || 320;
+        audioFormats.sort((a, b) => (b.abr || 0) - (a.abr || 0));
+        
+        let chosen = audioFormats[0];
+        for (const f of audioFormats) {
+          if ((f.abr || 0) >= targetBitrate) {
+            chosen = f;
+            break;
+          }
+          chosen = f;
+        }
+
+        chosenFormatUrl = chosen.url;
+        qualityLabel = Math.round(chosen.abr || 128) + ' kbps';
+        fileSize = chosen.filesize || chosen.filesize_approx || 0;
       } else {
+        // Video ke liye best progressive (audio+video) MP4 format dhoondo
         const targetRes = parseInt((max_resolution || '1080').replace('p', ''), 10) || 1080;
 
-        // Filter progressive (audio+video) MP4 formats
-        const mp4Progressive = info.formats.filter(f =>
-          f.container === 'mp4' &&
-          f.hasVideo &&
-          f.hasAudio &&
+        // Pehle progressive MP4 formats (audio+video) try karo
+        let progressive = info.formats.filter(f =>
+          f.ext === 'mp4' &&
+          f.vcodec !== 'none' &&
+          f.acodec !== 'none' &&
           (f.height || 0) <= targetRes
         );
 
-        if (mp4Progressive.length > 0) {
-          // Sort by height desc
-          mp4Progressive.sort((a, b) => (b.height || 0) - (a.height || 0));
-          chosenFormat = mp4Progressive[0];
+        if (progressive.length > 0) {
+          // Sabse best quality wala choose karo
+          progressive.sort((a, b) => (b.height || 0) - (a.height || 0));
+          chosenFormatUrl = progressive[0].url;
+          qualityLabel = progressive[0].height ? progressive[0].height + 'p' : targetRes + 'p';
+          fileSize = progressive[0].filesize || progressive[0].filesize_approx || 0;
         } else {
-          // Fallback: any mp4 with video
-          const mp4Any = info.formats.filter(f => f.container === 'mp4' && f.hasVideo);
-          mp4Any.sort((a, b) => (b.height || 0) - (a.height || 0));
-          chosenFormat = mp4Any[0];
+          // Agar progressive na mile, to video-only format choose karo (audio alag hoga)
+          const videoOnly = info.formats.filter(f =>
+            f.vcodec !== 'none' && (f.height || 0) <= targetRes
+          );
+          videoOnly.sort((a, b) => (b.height || 0) - (a.height || 0));
+          
+          if (videoOnly.length > 0) {
+            chosenFormatUrl = videoOnly[0].url;
+            qualityLabel = videoOnly[0].height ? videoOnly[0].height + 'p' : targetRes + 'p';
+            fileSize = videoOnly[0].filesize || videoOnly[0].filesize_approx || 0;
+          }
         }
 
-        if (!chosenFormat) {
-          chosenFormat = ytdl.chooseFormat(info.formats, { quality: 'highest' });
+        if (!chosenFormatUrl) {
+          throw new Error('No suitable video format');
         }
-
-        if (!chosenFormat) throw new Error('No suitable video format');
-        qualityLabel = chosenFormat.qualityLabel || (chosenFormat.height ? chosenFormat.height + 'p' : '720p');
       }
     } catch (err) {
       console.error('[Job] Format selection error:', err.message);
@@ -129,11 +152,6 @@ app.post('/proxy/jobs', async (req, res) => {
       });
     }
 
-    if (!chosenFormat || !chosenFormat.url) {
-      return res.status(500).json({ error: 'No download URL available' });
-    }
-
-    const fileSize = parseInt(chosenFormat.contentLength || 0, 10) || 0;
     const jobId = 'job_' + Date.now() + '_' + Math.random().toString(36).slice(2, 9);
 
     const job = {
@@ -148,8 +166,8 @@ app.post('/proxy/jobs', async (req, res) => {
       videoId: videoId,
       quality: qualityLabel,
       size: fileSize,
-      s3_url: chosenFormat.url,
-      download_url: chosenFormat.url,
+      s3_url: chosenFormatUrl,
+      download_url: chosenFormatUrl,
       created_at: new Date().toISOString()
     };
 
@@ -176,7 +194,7 @@ app.get('/proxy/jobs/:id', (req, res) => {
 });
 
 // ============================================================
-// ROUTE 3: DOWNLOAD PROXY
+// ROUTE 3: DOWNLOAD PROXY (Wahi purana, kaam karega)
 // ============================================================
 app.get('/proxy/download', async (req, res) => {
   const fileUrl = req.query.url;
@@ -195,6 +213,7 @@ app.get('/proxy/download', async (req, res) => {
   console.log('[Download] Start:', safeFilename);
 
   try {
+    // yt-dlp ke liye headers
     const upstreamHeaders = {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       'Accept': '*/*',
@@ -207,6 +226,9 @@ app.get('/proxy/download', async (req, res) => {
       upstreamHeaders['Range'] = req.headers.range;
     }
 
+    // node-fetch ki jagah axios use kar rahe hain (better streaming)
+    // Lekin aapke package.json mein node-fetch hai, to hum wahi use karenge
+    const fetch = require('node-fetch');
     const response = await fetch(decodedUrl, {
       method: 'GET',
       headers: upstreamHeaders,
@@ -262,6 +284,6 @@ app.listen(PORT, () => {
   console.log('===========================================');
   console.log('  youtubeHUB Proxy Server v3.0.0');
   console.log('  Running on port ' + PORT);
-  console.log('  Using @distube/ytdl-core');
+  console.log('  Using yt-dlp (youtube-dl-exec)');
   console.log('===========================================');
 });
